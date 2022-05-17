@@ -7,6 +7,7 @@ import "@openzeppelin/contracts/utils/Strings.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+import "base64-sol/base64.sol";
 
 // File: contracts/DorisNFT.sol
 
@@ -14,7 +15,6 @@ import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
 contract tokenFactory is Ownable {
     address public doris;
     address public platform;
-    address public addr;
 
     constructor(address _platform) {
         doris = msg.sender;
@@ -26,8 +26,8 @@ contract tokenFactory is Ownable {
         _;
     }
 
-    function newLine(address _artist, address[] memory _agents, uint256[] memory _agentsfees, uint256 _artistfees, uint256 _dorisfees, string memory _name, string memory _symbol, uint256 _maxSupply, address _link, address _oracle) public payable onlyDoris {
-        new DorisNFT(platform, doris, _artist, _link, _oracle, _agents, _agentsfees, _artistfees, _dorisfees, _name, _symbol);
+    function newLine(address _platform, address _doris, address _link, address _oracle, string memory _name, string memory _symbol) public payable onlyDoris {
+        new DorisNFT(_platform,_doris, _link, _oracle, _name, _symbol);
     }
 
 
@@ -45,36 +45,34 @@ contract DorisNFT is ERC721URIStorage, Ownable, ChainlinkClient {
 
     Counters.Counter private tokenIds;
 
-
-    string public uriPrefix = "";
-    string public uriSuffix = ".json";
-    string public hiddenMetadataUri;
-    //string public symbol;
-    //string public name;
     uint256 public cost;
     uint256 public maxSupply;
     address public factory;
     address public platform;
     address public doris;
     address public artist;
-    address[] public agents;
-    uint256 public artistfees;
-    uint256 public dorisfees;
+    uint8 public artistfees;
+    uint8 public dorisfees;
+    uint256 public fee;
+    bytes32 public jobId;
     bool public paused = true;
-    bytes32 public requestId;
+    bytes32[] requestIds;
     weatherNFT[] public weather_nfts;
+
+    string[5] imageURIs;
+    string imageURI;
+    string[5] precipitationTypes = ["No precipitation", "Rain", "Snow", "Ice", "Mixed"];
+
     
 
     //token structure
     struct weatherNFT {
-        string name;
+        string location;
         string precipitationType;
         uint256 timestamp;
-        uint24 precipitationPast12Hours;
         uint24 precipitationPast24Hours;
-        uint24 precipitationPastHour;
-        uint24 presssure;
-        uint16 temprature;
+        uint24 pressure;
+        uint16 temperature;
         uint16 windDirectionDegrees;
         uint16 windSpeed;
         uint8 relativeHumidity;
@@ -112,14 +110,11 @@ contract DorisNFT is ERC721URIStorage, Ownable, ChainlinkClient {
         uint8 weatherIcon;
     }
 
-
     // Maps
     mapping(bytes32 => CurrentConditionsResult) public requestIdCurrentConditionsResult;
     mapping(bytes32 => LocationResult) public requestIdLocationResult;
     mapping(bytes32 => RequestParams) public requestIdRequestParams;
-    mapping(address => uint256) public agentsfees;
-    mapping(uint256 => address) public tokenToOwner;
-    mapping(bytes32 => weatherNFT) public requestIdToToken;
+    mapping(uint256 => weatherNFT) public tokenIdToToken;
 
 
 
@@ -133,39 +128,18 @@ contract DorisNFT is ERC721URIStorage, Ownable, ChainlinkClient {
     constructor(
         address _platform,
         address _doris,
-        address _artist,
         address _link, 
         address _oracle,
-        address[] memory _agents, 
-        uint256[] memory _agentsfees,  
-        uint256 _dorisfees,
-        uint256 _artistfees, 
         string memory _name, 
         string memory _symbol
         ) ERC721(_name,_symbol) payable {
         
         setChainlinkToken(_link);
         setChainlinkOracle(_oracle);
-
-        require(_agents.length == _agentsfees.length, "Mismatch in agents fees");
         
-        uint256 totalfee = 0;
-        agents = _agents;
-
-        for (uint256 i = 0; i < _agents.length; i++) {
-        agents[i] = _agents[i];
-        agentsfees[agents[i]] = _agentsfees[i];
-        totalfee += _agentsfees[i];
-        }
-        require((_artistfees + _dorisfees + totalfee)<=100, "Fees > 100%");
         factory = msg.sender;
         doris = _doris;
-        //platform = _platform;
-        artist = _artist;
-        dorisfees = _dorisfees;
-        artistfees = _artistfees;
-        //symbol = _symbol;
-        //name = _name;
+        platform = _platform;
     }
 
     receive() external payable {
@@ -228,12 +202,13 @@ contract DorisNFT is ERC721URIStorage, Ownable, ChainlinkClient {
         uint256 _fee,
         string calldata _lat,
         string calldata _lon,
-        string calldata _units
+        string memory _units
     ) public {
-        LinkTokenInterface linkToken = LinkTokenInterface(chainlinkTokenAddress());
+            LinkTokenInterface linkToken = LinkTokenInterface(chainlinkTokenAddress());
         require( linkToken.balanceOf(address(this)) >= _fee,
          "Not enough LINK- fund contract!"
          );
+        
         Chainlink.Request memory request = buildChainlinkRequest(
             _jobId,
             address(this),
@@ -245,7 +220,7 @@ contract DorisNFT is ERC721URIStorage, Ownable, ChainlinkClient {
         request.add("lon", _lon);
         request.add("units", _units);
 
-        requestId = sendChainlinkRequest(request, _fee);
+        bytes32 requestId = sendChainlinkRequest(request, _fee);
 
         // Below this line is just an example of usage
         storeRequestParams(requestId, 0, "location-current-conditions", _lat, _lon, _units);
@@ -300,51 +275,47 @@ contract DorisNFT is ERC721URIStorage, Ownable, ChainlinkClient {
     function storeCurrentConditionsResult(bytes32 _requestId, bytes memory _currentConditionsResult) private {
         CurrentConditionsResult memory result = abi.decode(_currentConditionsResult, (CurrentConditionsResult));
         requestIdCurrentConditionsResult[_requestId] = result;
+        requestIds.push(_requestId);
     }
 
     function createToken(
-        string memory _name,
-        bytes32 _jobId,
-        uint256 _fee,
+        string memory _location,
         string calldata _lat,
-        string calldata _lon,
-        string calldata _units
-        ) public {
+        string calldata _lon
+        ) public onlyDoris {
 
-        string[5] memory precipitationTypes = ["No precipitation", "Rain", "Snow", "Ice", "Mixed"];
+        require(tokenIds.current()<maxSupply, "Max supply reached");
 
-        requestLocationCurrentConditions( _jobId,_fee,_lat,_lon,_units);
+        requestLocationCurrentConditions(jobId,fee,_lat,_lon,"metric");
 
+        weatherNFT memory newToken;
+       
+        newToken.location = _location;
 
-        string memory name = _name;
+        newToken.timestamp = requestIdCurrentConditionsResult[requestIds[requestIds.length]].timestamp;
 
-        uint256 timestamp = requestIdCurrentConditionsResult[requestId].timestamp;
+        newToken.precipitationPast24Hours = requestIdCurrentConditionsResult[requestIds[requestIds.length]].precipitationPast24Hours;
 
-        uint24 PP12Hrs = requestIdCurrentConditionsResult[requestId].precipitationPast12Hours;
+        newToken.pressure = requestIdCurrentConditionsResult[requestIds[requestIds.length]].pressure;
 
-        uint24 PP24Hrs = requestIdCurrentConditionsResult[requestId].precipitationPast24Hours;
+        newToken.temperature = requestIdCurrentConditionsResult[requestIds[requestIds.length]].temperature;
 
-        uint24 PPHr = requestIdCurrentConditionsResult[requestId].precipitationPastHour;
+        newToken.windDirectionDegrees = requestIdCurrentConditionsResult[requestIds[requestIds.length]].windDirectionDegrees;
 
-        uint24 pressure = requestIdCurrentConditionsResult[requestId].pressure;
+        newToken.windSpeed = requestIdCurrentConditionsResult[requestIds[requestIds.length]].windSpeed;
 
-        uint16 temperature = requestIdCurrentConditionsResult[requestId].temperature;
+        newToken.precipitationType = precipitationTypes[requestIdCurrentConditionsResult[requestIds[requestIds.length]].precipitationType];
 
-        uint16 windDD = requestIdCurrentConditionsResult[requestId].windDirectionDegrees;
+        newToken.relativeHumidity = requestIdCurrentConditionsResult[requestIds[requestIds.length]].relativeHumidity;
 
-        uint16 windSpeed = requestIdCurrentConditionsResult[requestId].windSpeed;
+        newToken.uvIndex = requestIdCurrentConditionsResult[requestIds[requestIds.length]].uvIndex;
 
-        string memory ppType = precipitationTypes[requestIdCurrentConditionsResult[requestId].precipitationType];
+        weather_nfts.push(newToken);
 
-        uint8 rH = requestIdCurrentConditionsResult[requestId].relativeHumidity;
-
-        uint8 uvI = requestIdCurrentConditionsResult[requestId].uvIndex;
-
-        weather_nfts.push(
-            weatherNFT(name, ppType, timestamp, PP12Hrs, PP24Hrs, PPHr, pressure, temperature, windDD, windSpeed, rH, uvI)
-        );
-
-    
+        tokenIds.increment();
+        _setTokenURI(tokenIds.current(), formatTokenURI(newToken));
+        _safeMint(msg.sender, tokenIds.current());
+        tokenIdToToken[tokenIds.current()] = weather_nfts[tokenIds.current() - 1];
     }
 
       /* ========== OTHER FUNCTIONS ========== */
@@ -357,16 +328,42 @@ contract DorisNFT is ERC721URIStorage, Ownable, ChainlinkClient {
         setChainlinkOracle(_oracle);
     }
 
-    function withdrawLink() public onlyPlatform {
+    function withdrawLink() public onlyDoris {
         LinkTokenInterface linkToken = LinkTokenInterface(chainlinkTokenAddress());
         require(linkToken.transfer(msg.sender, linkToken.balanceOf(address(this))), "Unable to withdraw funds");
     }
 
-    function setMaxSupply(uint256 _maxSupply) public onlyDoris {
+    function setMaxSupply(uint256 _maxSupply) external onlyPlatform {
         maxSupply = _maxSupply == 0 ? 2**256-1 : _maxSupply;
     }
 
-  
+    function setJobidAndFee(bytes32 _jobId, uint256 _fee) external onlyPlatform {
+        jobId = _jobId;
+        fee = _fee;
+    }
+
+    function setTokenPrice(uint256 _cost) external onlyDoris {
+        cost = _cost;
+    }
+
+    function setArtist(address _artist) external onlyPlatform {
+        artist = _artist;
+    }
+
+    function setFees(uint8 _dorisfees, uint8 _artistfees) external onlyDoris {
+        require((_artistfees + _dorisfees)<=100, "Fees > 100%");
+        dorisfees = _dorisfees;
+        artistfees = _artistfees;
+    }
+
+    
+
+    function setImageURIs(string[4] memory _imageURIs) external onlyDoris {
+        imageURIs = [_imageURIs[0], _imageURIs[1], _imageURIs[2], _imageURIs[2], _imageURIs[3]];
+        imageURI = imageURIs[requestIdCurrentConditionsResult[requestIds[requestIds.length]].precipitationType];
+    }
+     
+
 
     function togglePause() public onlyPlatform {
         paused = !paused;
@@ -376,43 +373,21 @@ contract DorisNFT is ERC721URIStorage, Ownable, ChainlinkClient {
         return tokenIds.current();
     }
 
-    function mint(address to) public payable onlyPlatform unpaused {
-        tokenIds.increment();
-        require(tokenIds.current()<maxSupply, "Max supply reached");
-        uint256 tokenId = tokenIds.current();
-        _safeMint(to, tokenId);
+    function mint(address _to, uint256 _tokenId) external payable unpaused {
+        require(msg.value >= cost);
+        require(_tokenId <= tokenIds.current());
+        _transfer(doris, _to, _tokenId);
         _handlepaymentnew(msg.value);
     }
 
-    function mintbulk(uint256 qty, address to) public payable onlyPlatform unpaused {
-        for (uint256 i = 0; i < qty; i++) {
-            tokenIds.increment();
-            require(tokenIds.current()< maxSupply, "Max supply reached");
-            uint256 tokenId = tokenIds.current();
-            _safeMint(to, tokenId);
-        }
-        _handlepaymentnew(msg.value);
-
-    }
-
-    function _handlepaymentnew(uint256 payment) internal {
-        for (uint256 i = 0; i < agents.length; i++) {
-            (bool agf, ) = payable(agents[i]).call{value: agentsfees[agents[i]]*payment/100}("");
-            require(agf, "Agent fee error");
-        }
+    function _handlepaymentnew(uint256 payment) public {
         (bool df, ) = payable(doris).call{value: dorisfees*payment/100}("");
         require(df, "Doris fee error");
-        (bool af, ) = payable(artist).call{value: artistfees*payment/100}("");
-        require(af, "Artist fee error");
         (bool ap, ) = payable(artist).call{value: address(this).balance}("");
         require(ap, "Artist payment error");
     }
 
-    function _handlepaymentold(address from, uint256 payment) internal {
-        for (uint256 i = 0; i < agents.length; i++) {
-            (bool agf, ) = payable(agents[i]).call{value: agentsfees[agents[i]]*payment/100}("");
-            require(agf, "Agent fee error");
-        }
+    function _handlepaymentold(address from, uint256 payment) public payable {
         (bool df, ) = payable(doris).call{value: dorisfees*payment/100}("");
         require(df, "Doris fee error");
         (bool af, ) = payable(artist).call{value: artistfees*payment/100}("");
@@ -420,29 +395,78 @@ contract DorisNFT is ERC721URIStorage, Ownable, ChainlinkClient {
         (bool ap, ) = payable(from).call{value: address(this).balance}("");
         require(ap, "Seller payment error");
     }
-
-    function tokenURI(uint256 _tokenId)
-        public
-        view
-        virtual
-        override
-        returns (string memory)
-    {
-        require(
-        _exists(_tokenId),
-        "ERC721Metadata: URI query for nonexistent token"
-        );
-
-    string memory currentBaseURI = _baseURI();
-    return bytes(currentBaseURI).length > 0
-        ? string(abi.encodePacked(currentBaseURI, _tokenId.toString(), uriSuffix))
-        : "";
+    
+    
+    function _base64(weatherNFT memory _newToken) 
+    private view returns(string memory) {
+        return(Base64.encode(bytes(
+                        abi.encodePacked(
+                            '{"name": "Weather NFT"',
+                            '"description": "A collection of artworks of landscapes/places around the world that respond to physical conditions at the location"' ,
+                            '"image":',imageURI,
+                            '"attributes": [',
+                                '{',
+                                    '"condition_type": "Location"',
+                                    '"value":', _newToken.location,
+                                '}',
+                                '{',
+                                    '"condition_type": "Precipitation Type"',
+                                    '"value":', _newToken.precipitationType,
+                                '}',
+                                '{',
+                                    '"condition_type": "Timestamp"',
+                                    '"value":', _newToken.timestamp,
+                                '}',
+                                '{',
+                                    '"condition_type": "Precipitation past 24 hours"',
+                                    '"value":', _newToken.precipitationPast24Hours,
+                                '}',
+                                '{',
+                                    '"condition_type": "Pressure"',
+                                    '"value":', _newToken.pressure,
+                                '}',
+                                '{',
+                                    '"condition_type": "Temprature"',
+                                    '"value":', _newToken.temperature,
+                                '}',
+                                '{',
+                                    '"condition_type": "Wind direction in degrees"',
+                                    '"value":', _newToken.windDirectionDegrees,
+                                '}',
+                                '{',
+                                    '"condition_type": "Wind speed"',
+                                    '"value":', _newToken.windSpeed,
+                                '}',
+                                '{',
+                                    '"condition_type": "Relative humidity"',
+                                    '"value":', _newToken.relativeHumidity,
+                                '}',
+                                '{',
+                                    '"condition_type": "uvIndex"',
+                                    '"value":', _newToken.uvIndex,
+                                '}',
+                            ']'
+                        '}'
+                            
+                        )
+                    )));
     }
+
+
+    function formatTokenURI(
+        weatherNFT memory _newToken 
+    ) internal returns (string memory) {
+        return string(abi.encodePacked(
+            "data:application/json;base64,", _base64(_newToken))
+        );    
+    }        
+
 
     function transferTokenFrom(address from, address to, uint256 tokenId) public payable onlyPlatform unpaused {
         transferFrom(from, to, tokenId);
         _handlepaymentold(from,msg.value);
     }
+
 
     function approve(address to, uint256 tokenId) public virtual override(ERC721) {
         address owner = ERC721.ownerOf(tokenId);
